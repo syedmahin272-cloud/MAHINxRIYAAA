@@ -1,12 +1,13 @@
 import asyncio
 import html
 import logging
+import re
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from aiohttp import web
-from api_client import HeroSMSClient
+from api_client import HeroSMSClient, check_telegram_numbers
 import database as db
 import keyboards as kb
 from states import BotStates
@@ -37,6 +38,53 @@ MENU_BUTTONS = [
     "Profile",
     "Support",
 ]
+
+
+def format_tg_status(raw_status: any) -> dict:
+  """Checker status filter kore emoji o badge generate kore"""
+  if raw_status is None:
+    return {"badge": "⚠️ Check Failed", "is_fresh": False}
+
+  if isinstance(raw_status, dict):
+    st = str(raw_status.get("status") or raw_status.get("result") or raw_status.get("msg") or raw_status).strip().lower()
+  elif isinstance(raw_status, bool):
+    st = "occupied" if raw_status else "unoccupied"
+  else:
+    st = str(raw_status).strip().lower()
+
+  if "api_error" in st or "check_failed" in st or not st:
+    return {"badge": "⚠️ Check Failed", "is_fresh": False}
+
+  # Fresh / Unoccupied
+  fresh_signals = [
+      "unoccupied", "phone_number_unoccupied",
+      "unregistered", "not_registered", "not registered", "non_registered",
+      "not_occupied", "not occupied", "free", "fresh", "available",
+      "ready", "allow", "ok", "valid", "clean", "false", "0",
+      "no_account", "no account", "does_not_exist", "not_exists"
+  ]
+  if any(w in st for w in fresh_signals):
+    if "banned" in st and not any(neg in st for neg in ["not", "un", "no", "non", "false"]):
+      return {"badge": "🚫 Banned", "is_fresh": False}
+    return {"badge": "✅ Fresh", "is_fresh": True}
+
+  # Locked / Flood / 2FA
+  locked_signals = ["flood", "locked", "lock", "wait", "restricted", "2fa", "password", "has_password"]
+  if any(w in st for w in locked_signals):
+    return {"badge": "🔒 Locked", "is_fresh": False}
+
+  # Registered / Occupied
+  occupied_signals = ["occupied", "registered", "taken", "used", "true", "1"]
+  if any(w in st for w in occupied_signals) and not any(neg in st for neg in ["not", "un", "no", "non", "false"]):
+    return {"badge": "❌ Registered", "is_fresh": False}
+
+  # Banned
+  banned_signals = ["banned", "ban", "blocked"]
+  if any(w in st for w in banned_signals) and not any(neg in st for neg in ["not", "un", "no", "non", "without", "false"]):
+    return {"badge": "🚫 Banned", "is_fresh": False}
+
+  clean = re.sub(r'phone_number_', '', st, flags=re.IGNORECASE).replace('_', ' ').strip().title()
+  return {"badge": f"⚠️ {clean}", "is_fresh": False}
 
 
 async def handle_herosms_webhook(request):
@@ -273,9 +321,14 @@ async def buy_single_number_process(
   aid = str(res["activationId"])
   phone = res.get("phoneNumber", "Unknown")
 
+  # Telegram Checker diye status check kora
+  check_res = await check_telegram_numbers([phone])
+  status_info = format_tg_status(check_res.get(f"+{phone}") or check_res.get(phone))
+  badge = status_info["badge"]
+
   msg = await bot.send_message(
       chat_id,
-      f"Number: <code>+{phone}</code>\nOTP: Waiting for SMS...",
+      f"Number: <code>+{phone}</code> — <b>{badge}</b>\nOTP: Waiting for SMS...",
       reply_markup=kb.number_action_menu(aid),
   )
 
@@ -381,21 +434,44 @@ async def process_bulk_amount(message: Message, state: FSMContext):
   user = await db.get_user(message.from_user.id)
   client = HeroSMSClient(user["api_key"])
 
-  await message.answer(f"Starting bulk purchase of {amount} numbers...")
+  status_msg = await message.answer(f"Starting bulk purchase of {amount} numbers...")
+  purchased_items = []
 
   for i in range(amount):
-    success = await buy_single_number_process(
-        message.bot,
-        message.from_user.id,
-        message.chat.id,
-        TG_SERVICE,
-        COLOMBIA_ID,
-        client,
+    res = await client.get_number(
+        service=TG_SERVICE, country=COLOMBIA_ID, max_price=MAX_PRICE
     )
-    if not success:
+    if isinstance(res, dict) and "activationId" in res:
+      aid = str(res["activationId"])
+      phone = res.get("phoneNumber", "Unknown")
+      purchased_items.append((aid, phone))
+      await db.save_activation(aid, message.from_user.id, phone, None)
+      asyncio.create_task(poll_sms(message.bot, message.chat.id, aid, phone, client))
+      await asyncio.sleep(0.3)
+    else:
       await message.answer(f"Stopped bulk purchase at item #{i+1}.")
       break
-    await asyncio.sleep(0.5)
+
+  if purchased_items:
+    try:
+      await status_msg.edit_text(f"✅ Purchased {len(purchased_items)} numbers!\n🔍 Checking Telegram status, please wait...")
+    except:
+      pass
+
+    phones_only = [p for _, p in purchased_items]
+    check_results = await check_telegram_numbers(phones_only)
+
+    lines = [f"🎉 <b>Bulk Purchase Summary ({len(purchased_items)}):</b>\n"]
+    for idx, (aid, phone) in enumerate(purchased_items, 1):
+      status_info = format_tg_status(check_results.get(f"+{phone}") or check_results.get(phone))
+      badge = status_info["badge"]
+      lines.append(f"{idx}. <code>+{phone}</code> — <b>{badge}</b>")
+
+    lines.append("\nWaiting for OTPs...")
+    final_text = "\n".join(lines)
+    await status_msg.edit_text(final_text)
+  else:
+    await status_msg.edit_text("Could not purchase any numbers.")
 
 
 @router.message(F.text == "Active Numbers")

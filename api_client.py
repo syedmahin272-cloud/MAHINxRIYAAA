@@ -1,8 +1,24 @@
 import json
 import logging
 import aiohttp
+import asyncio
+import re
+import urllib.request
+import urllib.error
+
+# requests thakle use korbe, na thakle built-in urllib diye 60s timeout-e cholbe
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 BASE_URL = "https://hero-sms.com/stubs/handler_api.php"
+
+# Telegram Checker API Credentials
+CHECKER_URL = "http://api.agbots.site:8080/check/"
+CHECKER_AUTH = "user8354"
+CHECKER_API_KEY = "SIGUzg7Xf7euGs8B"
 
 HEADERS = {
     "User-Agent": (
@@ -12,6 +28,82 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+
+def _sync_check_chunk(chunk_numbers: list) -> dict:
+    payload = {
+        "auth": CHECKER_AUTH,
+        "api_key": CHECKER_API_KEY,
+        "phone_numbers": chunk_numbers
+    }
+
+    if HAS_REQUESTS:
+        try:
+            resp = requests.get(CHECKER_URL, json=payload, timeout=60)
+            if resp.status_code == 200:
+                data = resp.json()
+                if str(data.get("status")) == "200":
+                    return data.get("result_obj") or {}
+                else:
+                    logging.warning(f"Checker API error: {data}")
+                    return {num: f"API_ERROR: {data.get('msg') or data}" for num in chunk_numbers}
+        except Exception as e:
+            logging.error(f"Checker requests failed: {e}")
+
+    try:
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            CHECKER_URL,
+            data=req_data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "python-requests/2.31.0",
+                "Accept": "*/*"
+            },
+            method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                if str(data.get("status")) == "200":
+                    return data.get("result_obj") or {}
+    except Exception as e:
+        logging.error(f"Checker urllib failed: {e}")
+
+    return {num: "CHECK_FAILED" for num in chunk_numbers}
+
+
+async def check_telegram_numbers(phone_numbers: list) -> dict:
+    """Telegram number checker helper function"""
+    if not phone_numbers:
+        return {}
+
+    unique_numbers = []
+    seen = set()
+    for p in phone_numbers:
+        clean = re.sub(r'[^\d]', '', str(p))
+        if 7 <= len(clean) <= 16:
+            formatted = f"+{clean}"
+            if formatted not in seen:
+                seen.add(formatted)
+                unique_numbers.append(formatted)
+
+    if not unique_numbers:
+        return {}
+
+    all_results = {}
+    chunk_size = 10
+
+    for i in range(0, len(unique_numbers), chunk_size):
+        chunk = unique_numbers[i:i + chunk_size]
+        res_obj = await asyncio.to_thread(_sync_check_chunk, chunk)
+        for k, v in res_obj.items():
+            clean_k = re.sub(r'[^\d]', '', str(k))
+            all_results[str(k)] = v
+            all_results[f"+{clean_k}"] = v
+            all_results[clean_k] = v
+
+    return all_results
 
 
 class HeroSMSClient:
